@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Painel de Atendimento - Chatbot</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: #f1f1f1; }
+        ::-webkit-scrollbar-thumb { background: #888; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #555; }
+        #chat-container-wrapper {
+            display: flex;
+            flex-direction: column;
+        }
+        .tab-button.active {
+            border-bottom-width: 2px;
+            border-color: #3b82f6; /* blue-500 */
+            background-color: #eff6ff; /* blue-50 */
+            color: #1e40af; /* blue-800 */
+        }
+    </style>
+</head>
+<body class="bg-gray-100 font-sans">
+    <div class="container mx-auto p-4 flex flex-col md:flex-row h-screen">
+        <!-- Coluna das Listas -->
+        <div class="w-full md:w-1/3 bg-white border-r border-gray-200 rounded-l-lg flex flex-col mb-4 md:mb-0">
+            <!-- Abas -->
+            <div class="flex border-b">
+                <button id="tab-individual" class="tab-button flex-1 p-3 font-semibold text-sm active">Atendimentos Individuais</button>
+                <button id="tab-grupos" class="tab-button flex-1 p-3 font-semibold text-sm text-gray-600">Grupos</button>
+            </div>
+            <!-- Conteúdo das Listas -->
+            <div id="list-container" class="flex-1 overflow-y-auto">
+                <div id="conversas-list-panel">
+                    <!-- Lista de conversas individuais será populada aqui -->
+                </div>
+                <div id="groups-list-panel" class="hidden">
+                    <!-- Lista de grupos será populada aqui -->
+                </div>
+            </div>
+        </div>
+        
+        <!-- Coluna Principal do Chat -->
+        <div class="w-full md:w-2/3 bg-gray-50 flex flex-col rounded-r-lg shadow-lg">
+            <div id="chat-header" class="p-4 bg-white border-b flex items-center justify-between">
+                <h2 class="text-xl font-bold text-gray-800">Selecione uma conversa ou grupo</h2>
+                <div class="flex items-center space-x-4">
+                    <button id="close-chat-button" class="bg-red-500 text-white px-3 py-1 rounded-lg hover:bg-red-600 font-semibold text-sm hidden">Encerrar Individual</button>
+                    <p id="connection-status" class="text-xs text-red-500 font-semibold">🔴 Desconectado</p>
+                </div>
+            </div>
+            <div id="chat-container-wrapper" class="flex-1 p-4 overflow-y-auto bg-gray-200">
+                <div class="text-center text-gray-500" id="welcome-message">
+                    <p>Bem-vindo ao Painel de Atendimento.</p>
+                </div>
+            </div>
+            <div id="input-area" class="p-4 bg-white border-t hidden">
+                 <div class="flex items-center">
+                    <label for="media-input" class="p-2 cursor-pointer text-gray-500 hover:text-blue-600">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" fill="currentColor" viewBox="0 0 16 16">
+                            <path d="M4.5 3a2.5 2.5 0 0 1 5 0v9a1.5 1.5 0 0 1-3 0V5a.5.5 0 0 1 1 0v7a.5.5 0 0 0 1 0V3a1.5 1.5 0 1 0-3 0v9a2.5 2.5 0 0 0 5 0V5a.5.5 0 0 1 1 0v7a3.5 3.5 0 1 1-7 0z"/>
+                        </svg>
+                    </label>
+                    <input type="file" id="media-input" class="hidden" accept="image/*,video/*">
+                    <input type="text" id="message-input" class="flex-1 border-y border-gray-200 p-2 focus:outline-none" placeholder="Digite sua resposta...">
+                    <button id="send-button" class="bg-blue-600 text-white p-2 px-6 rounded-r-lg hover:bg-blue-700 font-semibold">Enviar</button>
+                </div>
+                <div id="upload-status" class="text-xs text-center text-gray-500 pt-1"></div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script>
+        const socket = io();
+        
+        const tabIndividual = document.getElementById('tab-individual');
+        const tabGrupos = document.getElementById('tab-grupos');
+        const conversasListPanel = document.getElementById('conversas-list-panel');
+        const groupsListPanel = document.getElementById('groups-list-panel');
+        const chatHeader = document.getElementById('chat-header').querySelector('h2');
+        const chatContainerWrapper = document.getElementById('chat-container-wrapper');
+        const inputArea = document.getElementById('input-area');
+        const messageInput = document.getElementById('message-input');
+        const sendButton = document.getElementById('send-button');
+        const mediaInput = document.getElementById('media-input');
+        const uploadStatus = document.getElementById('upload-status');
+        const closeChatButton = document.getElementById('close-chat-button');
+        const connectionStatus = document.getElementById('connection-status');
+        const welcomeMessage = document.getElementById('welcome-message');
+
+        let activeConversationId = null;
+        let activeConversationType = null;
+
+        // --- Lógica das Abas ---
+        tabIndividual.addEventListener('click', () => {
+            conversasListPanel.classList.remove('hidden');
+            groupsListPanel.classList.add('hidden');
+            tabIndividual.classList.add('active');
+            tabGrupos.classList.remove('active');
+        });
+        tabGrupos.addEventListener('click', () => {
+            conversasListPanel.classList.add('hidden');
+            groupsListPanel.classList.remove('hidden');
+            tabGrupos.classList.add('active');
+            tabIndividual.classList.remove('active');
+        });
+
+        // --- Funções da UI ---
+        function addMessageToChat(sender, text, isGroup = false, participant = null) {
+            if (!text) return;
+            const div = document.createElement('div');
+            const alignment = sender === 'Atendente' ? 'justify-end' : 'justify-start';
+            const bgColor = sender === 'Atendente' ? 'bg-blue-500 text-white' : 'bg-white text-gray-800';
+            let participantHTML = '';
+            if (isGroup && participant && sender !== 'Atendente') {
+                participantHTML = `<p class="text-xs font-bold mb-1">${participant}</p>`;
+            }
+            div.className = `flex ${alignment} mb-2`;
+            div.innerHTML = `<div class="${bgColor} rounded-lg p-2 max-w-sm break-words">${participantHTML}${text}</div>`;
+            chatContainerWrapper.appendChild(div);
+            chatContainerWrapper.scrollTop = chatContainerWrapper.scrollHeight;
+        }
+
+        function resetChatView() {
+            activeConversationId = null;
+            activeConversationType = null;
+            chatHeader.textContent = 'Selecione uma conversa ou grupo';
+            chatContainerWrapper.innerHTML = '';
+            chatContainerWrapper.appendChild(welcomeMessage);
+            welcomeMessage.classList.remove('hidden');
+            inputArea.classList.add('hidden');
+            closeChatButton.classList.add('hidden');
+        }
+
+        function selectConversation(id, name, type) {
+            activeConversationId = id;
+            activeConversationType = type;
+            chatHeader.textContent = `Conversando com: ${name}`;
+            chatContainerWrapper.innerHTML = '';
+            inputArea.classList.remove('hidden');
+            welcomeMessage.classList.add('hidden');
+
+            if (type === 'individual') {
+                closeChatButton.classList.remove('hidden');
+                socket.emit('request_history', id);
+            } else if (type === 'group') {
+                closeChatButton.classList.add('hidden');
+                socket.emit('request_group_history', id);
+            }
+            
+            document.querySelectorAll('.conversa-item, .group-item').forEach(item => {
+                item.classList.remove('bg-blue-100', 'font-semibold');
+                if (item.dataset.id === id) {
+                    item.classList.add('bg-blue-100', 'font-semibold');
+                }
+            });
+        }
+        
+        function addConversationToList(convo) {
+            if (document.querySelector(`.conversa-item[data-id="${convo.userNumber}"]`)) return;
+            const div = document.createElement('div');
+            div.className = 'p-4 border-b cursor-pointer hover:bg-gray-100 conversa-item';
+            div.dataset.id = convo.userNumber;
+            div.innerHTML = `<p class="font-bold">${convo.userName}</p><p class="text-sm text-gray-600">${convo.userNumber}</p>`;
+            div.onclick = () => selectConversation(convo.userNumber, convo.userName, 'individual');
+            conversasListPanel.appendChild(div);
+        }
+        
+        function addGroupToList(group) {
+             if (document.querySelector(`.group-item[data-id="${group.groupId}"]`)) return;
+            const div = document.createElement('div');
+            div.className = 'p-4 border-b cursor-pointer hover:bg-gray-100 group-item';
+            div.dataset.id = group.groupId;
+            div.innerHTML = `<p class="font-bold">${group.groupName}</p>`;
+            div.onclick = () => selectConversation(group.groupId, group.groupName, 'group');
+            groupsListPanel.appendChild(div);
+        }
+
+        // --- Eventos do Socket.IO ---
+        socket.on('connect', () => {
+            console.log("Conectado ao servidor Socket.IO");
+            connectionStatus.textContent = '🟢 Conectado';
+            connectionStatus.classList.replace('text-red-500', 'text-green-500');
+        });
+        socket.on('disconnect', () => {
+            console.log("Desconectado do servidor Socket.IO");
+            connectionStatus.textContent = '🔴 Desconectado';
+            connectionStatus.classList.replace('text-green-500', 'text-red-500');
+        });
+
+        // Individual
+        socket.on('pending_conversations', (conversations) => conversations.forEach(addConversationToList));
+        socket.on('new_pending_conversation', (convo) => addConversationToList(convo));
+        socket.on('new_message', (data) => {
+            if (data.from === activeConversationId) addMessageToChat(data.userName, data.text);
+        });
+        socket.on('chat_history', (history) => {
+            chatContainerWrapper.innerHTML = '';
+            history.forEach(msg => addMessageToChat(msg.type === 'outgoing' ? 'Atendente' : 'Usuário', msg.text.body));
+        });
+        socket.on('conversation_closed', (userNumber) => {
+            const item = document.querySelector(`.conversa-item[data-id="${userNumber}"]`);
+            if (item) item.remove();
+            if (userNumber === activeConversationId) resetChatView();
+        });
+
+        // Grupos
+        socket.on('known_groups', (groups) => groups.forEach(addGroupToList));
+        socket.on('new_group_detected', (group) => addGroupToList(group));
+        socket.on('new_group_message', (data) => {
+            if (data.groupId === activeConversationId) addMessageToChat('Grupo', data.message.text.body, true, data.message.participant);
+        });
+        socket.on('group_chat_history', (history) => {
+            chatContainerWrapper.innerHTML = '';
+            history.forEach(msg => addMessageToChat(msg.type === 'outgoing' ? 'Atendente' : 'Grupo', msg.text.body, true, msg.participant));
+        });
+
+        // --- Eventos do Atendente ---
+        function sendMessageFromPanel() {
+            const message = messageInput.value.trim();
+            if (message && activeConversationId) {
+                if (activeConversationType === 'individual') {
+                    socket.emit('send_from_panel', { to: activeConversationId, text: message });
+                } else if (activeConversationType === 'group') {
+                    socket.emit('send_group_message_from_panel', { to: activeConversationId, text: message });
+                }
+                addMessageToChat('Atendente', message, activeConversationType === 'group');
+                messageInput.value = '';
+                messageInput.focus();
+            }
+        }
+
+        sendButton.addEventListener('click', sendMessageFromPanel);
+        messageInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') sendMessageFromPanel();
+        });
+
+        mediaInput.addEventListener('change', async () => {
+            const file = mediaInput.files[0];
+            if (!file || !activeConversationId) return;
+            uploadStatus.textContent = `Enviando ${file.name}...`;
+            const formData = new FormData();
+            formData.append('mediaFile', file);
+            formData.append('to', activeConversationId);
+            try {
+                const response = await fetch('/upload-media', { method: 'POST', body: formData });
+                const result = await response.json();
+                if (result.success) {
+                    uploadStatus.textContent = 'Mídia enviada!';
+                    addMessageToChat('Atendente', `[Mídia enviada: ${file.name}]`);
+                } else {
+                    uploadStatus.textContent = `Falha: ${result.message}`;
+                }
+            } catch (error) {
+                uploadStatus.textContent = 'Erro de conexão.';
+            } finally {
+                setTimeout(() => { uploadStatus.textContent = ''; }, 4000);
+                mediaInput.value = '';
+            }
+        });
+
+        closeChatButton.addEventListener('click', () => {
+            if(activeConversationId && activeConversationType === 'individual' && confirm(`Tem certeza que deseja encerrar o atendimento de ${activeConversationId}?`)) {
+                socket.emit('close_chat', activeConversationId);
+            }
+        });
+    </script>
+</body>
+</html>

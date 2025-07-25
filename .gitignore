@@ -1,0 +1,15 @@
+# Dependências
+/node_modules
+
+# Arquivos de Sistema do macOS
+.DS_Store
+
+# Arquivos compactados
+*.zip
+*.rar
+
+# Logs
+
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
