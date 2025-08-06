@@ -51,12 +51,12 @@ async function criarCobranca(token, httpsAgent, dadosMembro, valor) {
                 type: "CPF"
             },
             address: {
-                street: dadosMembro.endereco,
-                number: dadosMembro.numero,
-                district: dadosMembro.bairro,
+                street: dadosMembro.endereco || "Rua não informada",
+                number: dadosMembro.numero || "S/N",
+                district: dadosMembro.bairro || "Bairro não informado",
                 city: dadosMembro.cidade || "Cidade não informada",
-                state: dadosMembro.uf,
-                zip_code: dadosMembro.cep.replace(/\D/g, '') || "00000000"
+                state: dadosMembro.uf || "XX",
+                zip_code: (dadosMembro.cep || "00000000").replace(/\D/g, '')
             }
         },
         services: [{
@@ -94,6 +94,7 @@ async function gerarBoletoCora(dadosMembro, valor) {
         const httpsAgent = new https.Agent({
             cert: fs.readFileSync(path.join(__dirname, CERT_FILE_NAME)),
             key: fs.readFileSync(path.join(__dirname, KEY_FILE_NAME)),
+            passphrase: process.env.CORA_CERT_PASSPHRASE || null // Adicione se seu certificado tiver senha
         });
 
         const accessToken = await obterToken(httpsAgent);
@@ -101,13 +102,11 @@ async function gerarBoletoCora(dadosMembro, valor) {
         if (accessToken) {
             const cobrancaGerada = await criarCobranca(accessToken, httpsAgent, dadosMembro, valor);
             
-            // **LÓGICA CENTRALIZADA AQUI**
             const linkBoleto = cobrancaGerada?.payment_options?.bank_slip?.url;
             const linhaDigitavel = cobrancaGerada?.payment_options?.bank_slip?.digitable;
-            module.exports = { linhaDigitavel, linkBoleto };
 
-            if(linkBoleto && linhaDigitavel) {
-                
+            if (linkBoleto && linhaDigitavel) {
+                console.log("[Cora Module] Sucesso! Boleto gerado.");
                 return { link: linkBoleto, linhaDigitavel: linhaDigitavel };
             }
         }
@@ -115,9 +114,10 @@ async function gerarBoletoCora(dadosMembro, valor) {
         console.error("[Cora Module] Falha ao extrair dados do boleto da resposta da API.");
         return null;
     } catch (fileError) {
-        console.error("[Cora Module] ERRO AO LER OS ARQUIVOS DE CERTIFICADO.");
+        console.error("[Cora Module] ERRO AO LER OS ARQUIVOS DE CERTIFICADO:", fileError.message);
         return null;
     }
 }
 
+// Exportação correta no final do arquivo
 module.exports = { gerarBoletoCora };

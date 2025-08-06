@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Painel Administrativo - Eventos</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-100 p-8 font-sans">
+    <div class="container mx-auto max-w-4xl">
+        <h1 class="text-3xl font-bold text-gray-800 mb-6">Gestão de Eventos</h1>
+
+        <div class="bg-white p-6 rounded-lg shadow-md mb-8">
+            <h2 class="text-2xl font-semibold mb-4" id="form-title">Adicionar Novo Evento</h2>
+            <form id="event-form" class="space-y-4">
+                <input type="hidden" id="event-id">
+                <div>
+                    <label for="title" class="block text-sm font-medium text-gray-700">Título do Evento</label>
+                    <input type="text" id="title" required class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-2">
+                </div>
+                <div>
+                    <label for="description" class="block text-sm font-medium text-gray-700">Descrição</label>
+                    <textarea id="description" rows="3" required class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-2"></textarea>
+                </div>
+                <div class="flex items-center space-x-8">
+                    <div class="flex items-center">
+                        <input type="checkbox" id="paid" class="h-4 w-4 text-blue-600 border-gray-300 rounded">
+                        <label for="paid" class="ml-2 block text-sm text-gray-900">Evento Pago?</label>
+                    </div>
+                    <div id="amount-container" class="hidden">
+                        <label for="amount" class="block text-sm font-medium text-gray-700">Valor (ex: 75.00)</label>
+                        <input type="number" id="amount" step="0.01" class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm p-2">
+                    </div>
+                </div>
+                <div class="flex space-x-4">
+                    <button type="submit" class="bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700 font-semibold">Salvar Evento</button>
+                    <button type="button" id="cancel-edit-btn" class="bg-gray-500 text-white px-4 py-2 rounded-md hover:bg-gray-600 font-semibold hidden">Cancelar Edição</button>
+                </div>
+            </form>
+        </div>
+
+        <div class="bg-white p-6 rounded-lg shadow-md">
+            <h2 class="text-2xl font-semibold mb-4">Eventos Cadastrados</h2>
+            <div class="overflow-x-auto">
+                <table class="min-w-full divide-y divide-gray-200">
+                    <thead class="bg-gray-50">
+                        <tr>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Título</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Valor</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Ações</th>
+                        </tr>
+                    </thead>
+                    <tbody id="events-list" class="bg-white divide-y divide-gray-200">
+                        </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const form = document.getElementById('event-form');
+        const formTitle = document.getElementById('form-title');
+        const eventIdInput = document.getElementById('event-id');
+        const titleInput = document.getElementById('title');
+        const descriptionInput = document.getElementById('description');
+        const paidCheckbox = document.getElementById('paid');
+        const amountContainer = document.getElementById('amount-container');
+        const amountInput = document.getElementById('amount');
+        const eventsList = document.getElementById('events-list');
+        const cancelEditBtn = document.getElementById('cancel-edit-btn');
+
+        // Mostra/esconde o campo de valor quando o checkbox muda
+        paidCheckbox.addEventListener('change', () => {
+            amountContainer.classList.toggle('hidden', !paidCheckbox.checked);
+        });
+
+        // Função para buscar e exibir os eventos
+        async function fetchEvents() {
+            try {
+                const response = await fetch('/api/events');
+                const events = await response.json();
+                eventsList.innerHTML = ''; // Limpa a lista
+                events.forEach(event => {
+                    const row = `
+                        <tr id="event-${event._id}">
+                            <td class="px-6 py-4 whitespace-nowrap">
+                                <p class="text-sm font-medium text-gray-900">${event.title}</p>
+                                <p class="text-sm text-gray-500">${event.description}</p>
+                            </td>
+                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                                ${event.paid ? `R$ ${event.amount.toFixed(2)}` : 'Gratuito'}
+                            </td>
+                            <td class="px-6 py-4 whitespace-nowrap text-sm font-medium space-x-2">
+                                <button onclick="handleEdit('${event._id}')" class="text-indigo-600 hover:text-indigo-900">Editar</button>
+                                <button onclick="handleDelete('${event._id}')" class="text-red-600 hover:text-red-900">Excluir</button>
+                            </td>
+                        </tr>
+                    `;
+                    eventsList.insertAdjacentHTML('beforeend', row);
+                });
+            } catch (error) {
+                console.error('Erro ao buscar eventos:', error);
+                alert('Não foi possível carregar os eventos.');
+            }
+        }
+        
+        // Lida com o envio do formulário (criar ou atualizar)
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const eventId = eventIdInput.value;
+            const url = eventId ? `/api/events/${eventId}` : '/api/events';
+            const method = eventId ? 'PUT' : 'POST';
+
+            const eventData = {
+                title: titleInput.value,
+                description: descriptionInput.value,
+                paid: paidCheckbox.checked,
+                amount: amountInput.value || 0
+            };
+
+            try {
+                const response = await fetch(url, {
+                    method: method,
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(eventData)
+                });
+
+                if (!response.ok) throw new Error('Falha ao salvar evento.');
+                
+                resetForm();
+                fetchEvents(); // Atualiza a lista
+            } catch (error) {
+                console.error('Erro ao salvar evento:', error);
+                alert('Não foi possível salvar o evento.');
+            }
+        });
+
+        // Prepara o formulário para edição
+        async function handleEdit(id) {
+            const eventRow = document.getElementById(`event-${id}`);
+            const title = eventRow.querySelector('.text-sm.font-medium').textContent;
+            const description = eventRow.querySelector('.text-sm.text-gray-500').textContent;
+            const amountText = eventRow.cells[1].textContent;
+
+            const isPaid = !amountText.includes('Gratuito');
+            const amount = isPaid ? parseFloat(amountText.replace('R$ ', '')) : 0;
+            
+            formTitle.textContent = 'Editar Evento';
+            eventIdInput.value = id;
+            titleInput.value = title;
+            descriptionInput.value = description;
+            paidCheckbox.checked = isPaid;
+            amountInput.value = amount;
+            amountContainer.classList.toggle('hidden', !isPaid);
+            cancelEditBtn.classList.remove('hidden');
+            window.scrollTo(0, 0); // Rola para o topo
+        }
+        
+        // Apaga um evento
+        async function handleDelete(id) {
+            if (!confirm('Tem certeza que deseja apagar este evento?')) return;
+
+            try {
+                await fetch(`/api/events/${id}`, { method: 'DELETE' });
+                fetchEvents(); // Atualiza a lista
+            } catch (error) {
+                console.error('Erro ao apagar evento:', error);
+                alert('Não foi possível apagar o evento.');
+            }
+        }
+
+        function resetForm() {
+            form.reset();
+            formTitle.textContent = 'Adicionar Novo Evento';
+            eventIdInput.value = '';
+            amountContainer.classList.add('hidden');
+            cancelEditBtn.classList.add('hidden');
+        }
+
+        cancelEditBtn.addEventListener('click', resetForm);
+
+        // Carrega os eventos iniciais
+        document.addEventListener('DOMContentLoaded', fetchEvents);
+    </script>
+</body>
+</html>
