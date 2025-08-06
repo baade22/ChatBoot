@@ -1,0 +1,467 @@
+// index.js (Versão Final e Corrigida para Painel e Socket.IO)
+
+const path = require('path');
+require('dotenv').config({ path: path.resolve(__dirname, './.env') });
+
+// --- Importações de Módulos ---
+const express = require('express');
+const http = require('http');
+const { Server } = require("socket.io");
+const axios = require('axios');
+const fs = require('fs');
+const multer = require('multer');
+const session = require('express-session');
+const { ObjectId } = require('mongodb');
+
+// --- Nossas importações modulares ---
+const { connectToDatabase } = require('./database.js');
+const { menuPrincipalList, dizimoOptionsButtons, textos, registrationSteps, sexoOptionsButtons, estadoCivilOptionsList } = require('./constants.js');
+const adminRoutes = require('./adminRoutes.js');
+const { gerarBoletoCora } = require('./cora-api.js');
+const { gerarPixCora } = require('./pix-api.js');
+
+// --- Configurações Iniciais ---
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } });
+
+const SESSAO_TIMEOUT_MINUTOS = 10;
+const timeoutHandlers = new Map();
+
+const uploadDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadDir)) { fs.mkdirSync(uploadDir); }
+const upload = multer({ dest: uploadDir });
+
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+app.use(session({
+    secret: process.env.SESSION_SECRET || 'super-secret-key-default',
+    resave: false,
+    saveUninitialized: true,
+    cookie: { secure: false }
+}));
+
+// Ação Corretiva: Servir arquivos estáticos da pasta atual
+// Isto diz ao Express para procurar arquivos como .html, .css, .js na pasta 'chatbot-whatsapp'
+app.use(express.static(path.join(__dirname)));
+
+const { TOKEN_DE_VERIFICACAO, TOKEN_DO_WHATSAPP, ID_DO_NUMERO_DE_TELEFONE, PORT = 3000, ADMIN_PASSWORD, ADMIN_WHATSAPP_NUMBER, EKLESIA_API_URL, EKLESIA_API_TOKEN } = process.env;
+
+//======================================================================
+// LÓGICA DO CHATBOT (HANDLERS E FUNÇÕES AUXILIARES)
+//======================================================================
+
+async function sendWhatsAppMessage(to, messagePayload) {
+    try {
+        await axios.post(`https://graph.facebook.com/v20.0/${ID_DO_NUMERO_DE_TELEFONE}/messages`, {
+            messaging_product: 'whatsapp',
+            to: to,
+            ...messagePayload
+        }, { 
+            headers: { 'Authorization': `Bearer ${TOKEN_DO_WHATSAPP}` } 
+        });
+        console.log(`[WhatsApp Sucesso] Mensagem enviada para ${to}`);
+    } catch (error) {
+        console.error(`[WhatsApp Falha] Erro ao enviar para ${to}:`, error.response?.data?.error?.message || error.message);
+    }
+}
+
+function formatarDadosMembro(data) {
+    if (!data) return "Dados não encontrados.";
+    const [ano, mes, dia] = (data.dataNascimento || "---").split('T')[0].split('-');
+    const dataNascimentoFormatada = dia ? `${dia}/${mes}/${ano}` : "Não informado";
+    return `*Seus Dados Cadastrados:*\n\n` +
+        `*Nome:* ${data.nome || 'Não informado'}\n*Matrícula:* ${data.codigo || 'Não informado'}\n` +
+        `*CPF:* ${data.cpf || 'Não informado'}\n*Celular:* ${data.celular || 'Não informado'}\n` +
+        `*Nascimento:* ${dataNascimentoFormatada}\n*Endereço:* ${data.endereco || ''}, ${data.numero || ''} - ${data.bairro || ''}`;
+}
+
+async function enviarRelatorioInscricoes(db) {
+    const inscritos = await db.collection('eventRegistrations').find({}).sort({ dataGeracao: -1 }).limit(20).toArray();
+    if (inscritos.length === 0 || !ADMIN_WHATSAPP_NUMBER) return;
+    let relatorio = "🔔 *Relatório de Inscrições Atualizado* 🔔\n\n";
+    inscritos.forEach((insc) => {
+        relatorio += `*${insc.eventoNome}*\n   - *Nome:* ${insc.nomeMembro}\n   - *Pagamento:* ${insc.formaPagamento}\n` +
+                     `   - *Data:* ${new Date(insc.dataGeracao || insc.dataPagamento).toLocaleString('pt-BR')}\n` +
+                     `   - *Status:* ${insc.status || 'CONCLUÍDO'}\n\n`;
+    });
+    await sendWhatsAppMessage(ADMIN_WHATSAPP_NUMBER, { type: 'text', text: { body: relatorio } });
+}
+
+async function handleRegistration(from, message, db) {
+    const userState = await db.collection('userSessions').findOne({ _id: from });
+    if (!userState) return;
+
+    const currentStepIndex = userState.step;
+    const currentStep = registrationSteps[currentStepIndex];
+    let userInput = message.text?.body?.trim() || message.interactive?.button_reply?.title || message.interactive?.list_reply?.title;
+
+    if (userInput?.toLowerCase() === 'pular' && !currentStep.required) {
+    } else {
+        if (currentStep.required && !userInput) {
+            await sendWhatsAppMessage(from, { type: 'text', text: { body: `Esta informação é necessária. ${currentStep.question}` } });
+            return;
+        }
+        userState.formData[currentStep.key] = userInput;
+    }
+
+    const nextStepIndex = currentStepIndex + 1;
+    if (nextStepIndex < registrationSteps.length) {
+        const nextStep = registrationSteps[nextStepIndex];
+        await db.collection('userSessions').updateOne({ _id: from }, { $set: { step: nextStepIndex, formData: userState.formData } });
+        const messagePayload = nextStep.type === 'buttons' ? sexoOptionsButtons : (nextStep.type === 'list' ? estadoCivilOptionsList : { type: 'text', text: { body: nextStep.question } });
+        await sendWhatsAppMessage(from, messagePayload);
+    } else {
+        await sendWhatsAppMessage(from, { type: 'text', text: { body: "Cadastro finalizado! A processar os seus dados..." } });
+        try {
+            await sendWhatsAppMessage(from, { type: 'text', text: { body: "Seu cadastro foi realizado com sucesso! ✅" } });
+
+            if (userState.resumeAfterRegistration) {
+                await sendWhatsAppMessage(from, { type: 'text', text: { body: "Agora vamos continuar de onde parámos..." } });
+                const { action, event } = userState.resumeAfterRegistration;
+                const update = { $set: { action, step: 'ask_name', evento: event, ...(action.includes('generating') && { membroData: userState.formData }) }};
+                await db.collection('userSessions').updateOne({ _id: from }, update );
+                
+                const handlers = { 'eventRegistration': handleEventRegistration, 'generatingBoleto': handleContribution, 'generatingPix': handleContribution };
+                const simulatedMessage = { text: { body: userState.formData.nome } };
+                if(handlers[action]) await handlers[action](from, simulatedMessage, db);
+            } else {
+                await db.collection('userSessions').deleteOne({ _id: from });
+            }
+        } catch (error) {
+            await sendWhatsAppMessage(from, { type: 'text', text: { body: "Ocorreu um erro ao salvar seu cadastro." } });
+            await db.collection('userSessions').deleteOne({ _id: from });
+        }
+    }
+}
+
+async function handleMemberVerification(from, message, db) {
+    const userState = await db.collection('userSessions').findOne({ _id: from });
+    const receivedText = message.text?.body?.trim() || "";
+    const receivedId = message.interactive?.button_reply?.id;
+    switch (userState.step) {
+        case 'ask_name':
+            await sendWhatsAppMessage(from, { type: 'text', text: { body: `Ok, um momento... 🔍` } });
+            try {
+                const response = await axios.get(EKLESIA_API_URL, { params: { codIgreja: 1, nome: receivedText }, headers: { 'Authorization': `Bearer ${EKLESIA_API_TOKEN}` } });
+                if (response.data?.registros?.length > 0) {
+                    const foundData = response.data.registros[0];
+                    await db.collection('userSessions').updateOne({ _id: from }, { $set: { step: 'confirm_identity', foundData, typedName: receivedText } });
+                    const confirmMsg = `Encontrei este registo:\n\n*Nome:* ${foundData.nome}\n*CPF (final):* ***${foundData.cpf.slice(-3)}\n\nÉ você?`;
+                    await sendWhatsAppMessage(from, { type: "interactive", interactive: { type: "button", body: { text: confirmMsg }, action: { buttons: [{ type: "reply", reply: { id: "verify_confirm_yes", title: "Sim, sou eu" } }, { type: "reply", reply: { id: "verify_confirm_no", title: "Não sou eu" } }] } } });
+                } else {
+                    await db.collection('userSessions').updateOne({ _id: from }, { $set: { action: 'registering', step: 0, formData: { codIgreja: 1, celular: from, codArrolamento: 1, codMotivoArrolamento: 1 } } });
+                    await handleRegistration(from, { text: { body: receivedText } }, db);
+                }
+            } catch (error) {
+                await sendWhatsAppMessage(from, { type: 'text', text: { body: "Ocorreu um erro ao verificar seus dados." } });
+                await db.collection('userSessions').deleteOne({ _id: from });
+            }
+            break;
+        case 'confirm_identity':
+            if (receivedId === 'verify_confirm_yes') {
+                await sendWhatsAppMessage(from, { type: 'text', text: { body: "Ótimo! Aqui estão os seus dados:" } });
+                await sendWhatsAppMessage(from, { type: 'text', text: { body: formatarDadosMembro(userState.foundData) } });
+                await db.collection('userSessions').deleteOne({ _id: from });
+            } else {
+                await db.collection('userSessions').updateOne({ _id: from }, { $set: { action: 'registering', step: 0, formData: { codIgreja: 1, celular: from, codArrolamento: 1, codMotivoArrolamento: 1 } } });
+                await handleRegistration(from, { text: { body: userState.typedName } }, db);
+            }
+            break;
+    }
+}
+
+async function handleContribution(from, message, db) {
+    const userState = await db.collection('userSessions').findOne({ _id: from });
+    const receivedText = message.text?.body?.trim() || "";
+    const receivedId = message.interactive?.button_reply?.id;
+    const paymentType = userState.action === 'generatingBoleto' ? 'boleto' : 'pix';
+    switch (userState.step) {
+        case 'ask_name':
+            await sendWhatsAppMessage(from, { type: 'text', text: { body: `Ok, a pesquisar por "${receivedText}"... 🔍` } });
+            try {
+                const response = await axios.get(EKLESIA_API_URL, { params: { codIgreja: 1, nome: receivedText }, headers: { 'Authorization': `Bearer ${EKLESIA_API_TOKEN}` } });
+                if (response.data?.registros?.length > 0) {
+                    const membroData = response.data.registros[0];
+                    await db.collection('userSessions').updateOne({ _id: from }, { $set: { step: 'confirm_identity', membroData } });
+                    const confirmMsg = `Encontrei este registo:\n\n*Nome:* ${membroData.nome}\n*CPF (final):* ***${membroData.cpf.slice(-3)}\n\nÉ você?`;
+                    await sendWhatsAppMessage(from, { type: "interactive", interactive: { type: "button", body: { text: confirmMsg }, action: { buttons: [{ type: "reply", reply: { id: "contrib_confirm_yes", title: "Sim, sou eu" } }, { type: "reply", reply: { id: "contrib_confirm_no", title: "Não sou eu" } }] } } });
+                } else {
+                    await db.collection('userSessions').updateOne({ _id: from }, { $set: { action: 'registering', step: 0, formData: { codIgreja: 1, celular: from, codArrolamento: 1, codMotivoArrolamento: 1 }, resumeAfterRegistration: { action: userState.action } } });
+                    await handleRegistration(from, { text: { body: receivedText } }, db);
+                }
+            } catch (error) {
+                await sendWhatsAppMessage(from, { type: 'text', text: { body: "Ocorreu um erro ao buscar os seus dados." } });
+                await db.collection('userSessions').deleteOne({ _id: from });
+            }
+            break;
+        case 'confirm_identity':
+            if (receivedId === 'contrib_confirm_yes') {
+                await db.collection('userSessions').updateOne({ _id: from }, { $set: { step: 'ask_value' } });
+                await sendWhatsAppMessage(from, { type: 'text', text: { body: "Ótimo! Por favor, informe o valor que deseja doar (Ex: 50,00)" } });
+            } else {
+                await sendWhatsAppMessage(from, { type: 'text', text: { body: "Ok. Para tentar novamente, por favor, escolha a opção de contribuição no menu." } });
+                await db.collection('userSessions').deleteOne({ _id: from });
+            }
+            break;
+        case 'ask_value':
+            const valor = parseFloat(receivedText.replace(',', '.'));
+            if (isNaN(valor) || valor < 1) {
+                await sendWhatsAppMessage(from, { type: 'text', text: { body: "Valor inválido. Por favor, digite um valor numérico (Ex: 50,00)." } });
+                return;
+            }
+            await sendWhatsAppMessage(from, { type: 'text', text: { body: `A gerar sua contribuição via ${paymentType}, aguarde... 🏦` } });
+            try {
+                const resultData = await (paymentType === 'boleto' ? gerarBoletoCora(userState.membroData, valor) : gerarPixCora(userState.membroData, valor));
+                const responseMsg = paymentType === 'boleto' ? `Boleto gerado! ✅\n\n*Link:* ${resultData.link}\n\n*Linha Digitável:*\n\`\`\`${resultData.linhaDigitavel}\`\`\`` : `PIX gerado! ✅\n\nCopie o código abaixo e cole no seu app do banco:\n\n\`\`\`${resultData.emv}\`\`\``;
+                await sendWhatsAppMessage(from, { type: 'text', text: { body: responseMsg } });
+            } catch (error) {
+                await sendWhatsAppMessage(from, { type: 'text', text: { body: "Não foi possível gerar sua contribuição neste momento." } });
+            } finally {
+                await db.collection('userSessions').deleteOne({ _id: from });
+            }
+            break;
+    }
+}
+
+async function handleEventRegistration(from, message, db) {
+    const userState = await db.collection('userSessions').findOne({ _id: from });
+    if (!userState) return;
+    const receivedText = message.text?.body?.trim() || "";
+    const receivedId = message.interactive?.list_reply?.id || message.interactive?.button_reply?.id;
+    switch (userState.step) {
+        case 'select_event':
+            const eventosFromDB = await db.collection('events').find({}).sort({ title: 1 }).toArray();
+            const eventoSelecionado = eventosFromDB.find(e => e._id.toString() === receivedId);
+            if (!eventoSelecionado) {
+                await sendWhatsAppMessage(from, { type: 'text', text: { body: "Opção de evento inválida. Por favor, selecione uma da lista." } });
+                const eventRows = eventosFromDB.map(e => ({ id: e._id.toString(), title: e.title, description: e.description }));
+                const eventListMessage = { type: "interactive", interactive: { type: "list", header: { type: "text", text: "Eventos Disponíveis" }, body: { text: "Temos estes eventos abertos. Selecione um:" }, action: { button: "Ver Eventos", sections: [{ title: "Nossos Eventos", rows: eventRows }] } } };
+                await sendWhatsAppMessage(from, eventListMessage);
+                return;
+            }
+            await db.collection('userSessions').updateOne({ _id: from }, { $set: { step: 'ask_name', evento: eventoSelecionado } });
+            await sendWhatsAppMessage(from, { type: 'text', text: { body: `Ótima escolha! Para se inscrever no evento "${eventoSelecionado.title}", por favor, digite o seu nome completo:` } });
+            break;
+        case 'ask_name':
+            await sendWhatsAppMessage(from, { type: 'text', text: { body: `Ok, a verificar seu cadastro por "${receivedText}"... 🔍` } });
+            try {
+                const response = await axios.get(EKLESIA_API_URL, { params: { codIgreja: 1, nome: receivedText }, headers: { 'Authorization': `Bearer ${EKLESIA_API_TOKEN}` } });
+                if (response.data?.registros?.length > 0) {
+                    const membroData = response.data.registros[0];
+                    await db.collection('userSessions').updateOne({ _id: from }, { $set: { step: 'confirm_identity', membroData } });
+                    const confirmMsg = `Encontrei este registo:\n\n*Nome:* ${membroData.nome}\n*CPF (final):* ***${membroData.cpf.slice(-3)}\n\nÉ você?`;
+                    await sendWhatsAppMessage(from, { type: "interactive", interactive: { type: "button", body: { text: confirmMsg }, action: { buttons: [{ type: "reply", reply: { id: "event_confirm_yes", title: "Sim, sou eu" } }, { type: "reply", reply: { id: "event_confirm_no", title: "Não sou eu" } }] } } });
+                } else {
+                    await db.collection('userSessions').updateOne({ _id: from }, { $set: { action: 'registering', step: 0, formData: { codIgreja: 1, celular: from, codArrolamento: 1, codMotivoArrolamento: 1 }, resumeAfterRegistration: { action: 'eventRegistration', event: userState.evento } } });
+                    await handleRegistration(from, { text: { body: receivedText } }, db);
+                }
+            } catch (error) {
+                await sendWhatsAppMessage(from, { type: 'text', text: { body: "Ocorreu um erro ao buscar seus dados." } });
+                await db.collection('userSessions').deleteOne({ _id: from });
+            }
+            break;
+        case 'confirm_identity':
+            const evento = userState.evento;
+            if (receivedId === 'event_confirm_yes') {
+                if (evento.paid) {
+                    await db.collection('userSessions').updateOne({ _id: from }, { $set: { step: 'ask_payment' } });
+                    const valorFormatado = evento.amount.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
+                    await sendWhatsAppMessage(from, { type: 'text', text: { body: `Perfeito! O valor da inscrição para "${evento.title}" é de ${valorFormatado}. Como deseja pagar?` } });
+                    const paymentOptions = { type: "interactive", interactive: { type: "button", body: { text: `Forma de Pagamento` }, action: { buttons: [{ type: "reply", reply: { id: "dizimo_boleto", title: "Boleto Bancário" } }, { type: "reply", reply: { id: "dizimo_pix", title: "PIX" } }] } } };
+                    await sendWhatsAppMessage(from, paymentOptions);
+                } else {
+                    await sendWhatsAppMessage(from, { type: 'text', text: { body: `Inscrição para o evento gratuito "${evento.title}" realizada com sucesso! ✅` } });
+                    await db.collection('eventRegistrations').insertOne({ eventoId: evento._id.toString(), eventoNome: evento.title, nomeMembro: userState.membroData.nome, dataPagamento: new Date(), formaPagamento: 'Gratuito', valor: 0, status: 'CONCLUÍDO' });
+                    await enviarRelatorioInscricoes(db);
+                    await db.collection('userSessions').deleteOne({ _id: from });
+                }
+            } else {
+                await sendWhatsAppMessage(from, { type: 'text', text: { body: "Ok. Para tentar com outro nome, escolha a opção de eventos no menu." } });
+                await db.collection('userSessions').deleteOne({ _id: from });
+            }
+            break;
+        case 'ask_payment':
+            const formaPagamentoId = receivedId;
+            const eventoPagamento = userState.evento;
+            const membroPagamento = userState.membroData;
+            let paymentType;
+            if (formaPagamentoId === 'dizimo_boleto') paymentType = 'boleto';
+            else if (formaPagamentoId === 'dizimo_pix') paymentType = 'pix';
+            else { await sendWhatsAppMessage(from, { type: 'text', text: { body: "Opção de pagamento inválida." } }); return; }
+            await sendWhatsAppMessage(from, { type: 'text', text: { body: `A gerar sua forma de pagamento via ${paymentType}, aguarde... 🏦` } });
+            try {
+                const resultData = await (paymentType === 'boleto' ? gerarBoletoCora(membroPagamento, eventoPagamento.amount) : gerarPixCora(membroPagamento, eventoPagamento.amount));
+                const responseMsg = paymentType === 'boleto' ? `Boleto gerado! ✅\n\n*Link:* ${resultData.link}\n\n*Linha Digitável:*\n\`\`\`${resultData.linhaDigitavel}\`\`\`` : `PIX gerado! ✅\n\nCopie o código abaixo e cole no seu app do banco:\n\n\`\`\`${resultData.emv}\`\`\``;
+                await sendWhatsAppMessage(from, { type: 'text', text: { body: responseMsg } });
+                await sendWhatsAppMessage(from, { type: 'text', text: { body: "Sua inscrição será confirmada após o pagamento. Deus abençoe!" } });
+                await db.collection('eventRegistrations').insertOne({ eventoId: eventoPagamento._id.toString(), eventoNome: eventoPagamento.title, nomeMembro: membroPagamento.nome, dataGeracao: new Date(), formaPagamento: paymentType, valor: eventoPagamento.amount, status: 'AGUARDANDO_PAGAMENTO' });
+                await enviarRelatorioInscricoes(db);
+            } catch (error) {
+                await sendWhatsAppMessage(from, { type: 'text', text: { body: "Não foi possível gerar sua forma de pagamento." } });
+            } finally {
+                await db.collection('userSessions').deleteOne({ _id: from });
+            }
+            break;
+    }
+}
+
+const allHandlers = {
+    'registering': handleRegistration,
+    'verifyingMember': handleMemberVerification,
+    'generatingBoleto': handleContribution,
+    'generatingPix': handleContribution,
+    'eventRegistration': handleEventRegistration
+};
+
+//======================================================================
+// SERVIDOR EXPRESS E SOCKET.IO
+//======================================================================
+
+const requireAuth = (req, res, next) => req.session.isAuthenticated ? next() : res.redirect('/login');
+
+app.use('/api', requireAuth, adminRoutes);
+
+app.get('/login', (req, res) => {
+    res.send(`
+        <body style="font-family: sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; background: #f0f2f5; margin: 0;">
+            <form action="/login" method="post" style="padding: 2rem; background: white; border-radius: 8px; width: 300px;">
+                <h1 style="text-align: center; margin-bottom: 1.5rem;">Login</h1>
+                <input type="password" name="password" placeholder="Senha" required style="width: 100%; box-sizing: border-box; padding: 0.75rem; border-radius: 4px; border: 1px solid #ccc; margin-bottom: 1rem;">
+                <button type="submit" style="width: 100%; padding: 0.75rem; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer;">Entrar</button>
+            </form>
+        </body>
+    `);
+});
+
+app.post('/login', (req, res) => {
+    if (req.body.password === ADMIN_PASSWORD) {
+        req.session.isAuthenticated = true;
+        res.redirect('/admin.html');
+    } else {
+        res.status(401).send('Senha incorreta.');
+    }
+});
+
+app.get('/admin', requireAuth, (req, res) => res.redirect('/admin.html'));
+app.get('/painel', requireAuth, (req, res) => res.redirect('/atendente.html'));
+
+
+app.get('/webhook', (req, res) => {
+    const { 'hub.mode': mode, 'hub.verify_token': token, 'hub.challenge': challenge } = req.query;
+    if (mode && token === TOKEN_DE_VERIFICACAO) res.status(200).send(challenge);
+    else res.sendStatus(403);
+});
+
+// Rota principal do Webhook
+app.post('/webhook', (req, res) => {
+    // Ação 1: Responder imediatamente ao WhatsApp
+    res.sendStatus(200);
+
+    // Ação 2: Processar a mensagem em segundo plano
+    const process = async () => {
+        const db = app.locals.db;
+        try {
+            const message = req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+            if (!message) return;
+
+            const from = message.from;
+            if (timeoutHandlers.has(from)) clearTimeout(timeoutHandlers.get(from));
+
+            const userState = await db.collection('userSessions').findOne({ _id: from });
+
+            if (userState?.action) {
+                const handler = allHandlers[userState.action];
+                if (handler) await handler(from, message, db);
+            } else {
+                const receivedId = message.interactive?.list_reply?.id || message.interactive?.button_reply?.id;
+                if (receivedId) {
+                    let messagePayload;
+                    switch (receivedId) {
+                        case 'menu_membros':
+                            await db.collection('userSessions').updateOne({ _id: from }, { $set: { action: 'verifyingMember', step: 'ask_name' } }, { upsert: true });
+                            await sendWhatsAppMessage(from, { type: 'text', text: { body: "Ok. Para começar, digite o seu *nome completo*:" } });
+                            break;
+                        case 'menu_eventos':
+                            const eventosFromDB = await db.collection('events').find({}).sort({ title: 1 }).toArray();
+                            if (eventosFromDB.length === 0) {
+                                messagePayload = { type: 'text', text: { body: "No momento, não temos eventos com inscrições abertas." } };
+                            } else {
+                                const eventRows = eventosFromDB.map(e => ({ id: e._id.toString(), title: e.title, description: e.description }));
+                                messagePayload = { type: "interactive", interactive: { type: "list", header: { type: "text", text: "Eventos Disponíveis" }, body: { text: "Temos os seguintes eventos abertos:" }, action: { button: "Ver Eventos", sections: [{ title: "Nossos Eventos", rows: eventRows }] } } };
+                                await db.collection('userSessions').updateOne({ _id: from }, { $set: { action: 'eventRegistration', step: 'select_event' } }, { upsert: true });
+                            }
+                            break;
+                        case 'menu_dizimos': messagePayload = dizimoOptionsButtons; break;
+                        case 'menu_redes_sociais':
+                            messagePayload = { type: 'text', text: { body: textos.redesSociais } };
+                            break;
+                        case 'menu_cultos':
+                            messagePayload = { type: 'text', text: { body: textos.cultos } };
+                            break;
+                        case 'dizimo_boleto':
+                            await db.collection('userSessions').updateOne({ _id: from }, { $set: { action: 'generatingBoleto', step: 'ask_name' } }, { upsert: true });
+                            await sendWhatsAppMessage(from, { type: 'text', text: { body: "Para gerar o seu boleto, por favor, digite o seu nome completo:" } });
+                            break;
+                        case 'dizimo_pix':
+                            await db.collection('userSessions').updateOne({ _id: from }, { $set: { action: 'generatingPix', step: 'ask_name' } }, { upsert: true });
+                            await sendWhatsAppMessage(from, { type: 'text', text: { body: "Para gerar o seu PIX, por favor, digite o seu nome completo:" } });
+                            break;
+                            case 'menu_falar_equipe':
+                                await db.collection('pendingConversations').insertOne({ _id: from, userNumber: from, userName: userName, createdAt: new Date() });
+                                io.emit('new_pending_conversation', { userNumber: from, userName });
+                                messagePayload = { type: 'text', text: { body: textos.falarComEquipe } };
+                                const numeroAtendente = '5581999686995';
+                                const notificacao = `🔔 *Alerta de Atendimento* 🔔\n\nO cliente *${userName}* (${from}) solicitou atendimento e está a aguardar no painel.`;
+                                await sendWhatsAppMessage(numeroAtendente, { type: 'text', text: { body: notificacao } });
+                                break;
+                        default: messagePayload = { type: 'text', text: { body: textos[receivedId] || "Opção inválida." } };
+                    }
+                    if (messagePayload) await sendWhatsAppMessage(from, messagePayload);
+                } else if (message.text) await sendWhatsAppMessage(from, menuPrincipalList);
+            }
+            if (message.interactive?.button_reply?.id !== 'menu_falar_equipe') {
+                const timeoutId = setTimeout(async () => {
+                    await db.collection('userSessions').deleteOne({ _id: from });
+                    timeoutHandlers.delete(from);
+                    await sendWhatsAppMessage(from, { type: 'text', text: { body: "Sua sessão expirou. Para começar de novo, envie qualquer mensagem." } });
+                }, SESSAO_TIMEOUT_MINUTOS * 60 * 1000);
+                timeoutHandlers.set(from, timeoutId);
+            }
+        } catch (error) {
+            console.error("ERRO NO PROCESSAMENTO DO WEBHOOK:", error);
+        }
+    };
+    process();
+});
+
+io.on('connection', async (socket) => {
+    const db = app.locals.db; // Ação Corretiva: Pega o 'db' do app.locals
+    console.log('Painel conectado:', socket.id);
+    socket.emit('pending_conversations', await db.collection('pendingConversations').find({}).toArray());
+    
+    socket.on('send_from_panel', (data) => sendWhatsAppMessage(data.to, { type: 'text', text: { body: data.text } }));
+    socket.on('request_history', async (userNumber) => socket.emit('chat_history', []));
+    socket.on('close_chat', async (userNumber) => {
+        await db.collection('pendingConversations').deleteOne({ _id: userNumber });
+        io.emit('conversation_closed', userNumber);
+        sendWhatsAppMessage(userNumber, { type: 'text', text: { body: textos.atendimentoEncerradoPeloPainel } });
+    });
+    socket.on('disconnect', () => console.log('Painel desconectado:', socket.id));
+});
+
+async function startServer() {
+    try {
+        const db = await connectToDatabase();
+        app.locals.db = db;
+        server.listen(PORT, () => {
+            console.log(`[Servidor] A funcionar na porta ${PORT}`);
+            console.log(`[Servidor] Painel de Login: http://localhost:${PORT}/login`);
+        });
+    } catch (error) {
+        console.error("[Servidor] Falha ao iniciar:", error);
+        process.exit(1);
+    }
+}
+
+startServer();
