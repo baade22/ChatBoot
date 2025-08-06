@@ -481,7 +481,12 @@ app.post('/webhook', async (req, res) => {
                             break;
                         case 'menu_falar_equipe':
                             const userName = body.entry[0].changes[0].value.contacts[0].profile.name || from;
-                            await db.collection('pendingConversations').insertOne({ _id: from, userNumber: from, userName: userName, createdAt: new Date() });
+                            // **CORREÇÃO APLICADA AQUI**
+                            await db.collection('pendingConversations').updateOne(
+                                { _id: from },
+                                { $set: { userNumber: from, userName: userName, createdAt: new Date() } },
+                                { upsert: true }
+                            );
                             io.emit('new_pending_conversation', { userNumber: from, userName });
                             messagePayload = { type: 'text', text: { body: textos.falarComEquipe } };
                             const numeroAtendente = '5581999686995';
