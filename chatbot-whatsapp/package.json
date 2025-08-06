@@ -2,9 +2,9 @@
   "name": "chatbot-whatsapp",
   "version": "1.0.0",
   "main": "index.js",
- "scripts": {
-  "start": "node index.js"
-},
+  "scripts": {
+    "start": "node index.js"
+  },
   "keywords": [],
   "author": "",
   "license": "ISC",
@@ -13,6 +13,7 @@
     "axios": "^1.9.0",
     "dotenv": "^16.5.0",
     "express": "^5.1.0",
+    "express-session": "^1.18.2",
     "form-data": "^4.0.3",
     "fs": "^0.0.1-security",
     "multer": "^2.0.1",
